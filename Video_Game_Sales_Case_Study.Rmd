@@ -1,0 +1,595 @@
+---
+title: "Video Game Sales Analysis & Genre/Platform Success Prediction"
+author: "Case Study Report"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: readable
+    code_folding: hide
+---
+
+# 1. Introduction
+
+This case study analyses historical video-game sales data to understand sales patterns across genres, gaming platforms, publishers, release years, and regions. It also builds and compares two baseline machine-learning classifiers—Decision Tree and Logistic Regression—to classify games into **High Sales** and **Low Sales** categories. LIME (Local Interpretable Model-agnostic Explanations) is used to explain selected Logistic Regression predictions.
+
+The dataset is obtained from the public Kaggle page:
+
+- Dataset page: <https://www.kaggle.com/datasets/anandshaw2001/video-game-sales>
+- Direct download endpoint: <https://www.kaggle.com/api/v1/datasets/download/anandshaw2001/video-game-sales>
+
+The analysis is exploratory and educational. Model results describe patterns in this historical dataset and do not guarantee future commercial success.
+
+# 2. Objectives
+
+- Inspect and clean the video-game sales dataset.
+- Summarise missing values, duplicate records, and dataset structure.
+- Compare total sales by genre, platform, publisher, year, and region.
+- Visualise global sales distributions and release-year trends.
+- Define a High/Low sales classification target using the training-data median.
+- Train a Decision Tree and Logistic Regression model using game attributes.
+- Evaluate both models using classification metrics.
+- Use LIME to explain selected individual Logistic Regression predictions.
+
+# 3. Dataset and variables
+
+The commonly used Kaggle CSV contains fields such as `Rank`, `Name`, `Platform`, `Year`, `Genre`, `Publisher`, `NA_Sales`, `EU_Sales`, `JP_Sales`, `Other_Sales`, and `Global_Sales`. The exact file and column names are checked when the data is loaded.
+
+The predictors used by the classification models are:
+
+- `Genre`
+- `Platform`
+- `Publisher`
+- `Year`
+
+The target is created from `Global_Sales`. Global and regional sales fields are not used as predictors, reducing direct target leakage.
+
+# 4. Setup and packages
+
+The first run may take a few minutes while R installs required packages. If a package installation fails, install that package in the R environment and rerun this document.
+
+```{r setup, message=FALSE, warning=FALSE}
+required_packages <- c("ggplot2", "dplyr", "tidyr", "rpart", "rpart.plot", "lime", "knitr", "rmarkdown")
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+}
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(rpart)
+  library(rpart.plot)
+  library(lime)
+  library(knitr)
+})
+
+set.seed(42)
+options(stringsAsFactors = FALSE)
+```
+
+# 5. Download and load the dataset
+
+This chunk first checks for a compatible CSV in the working directory. If no compatible CSV is found, it attempts to download the public Kaggle dataset ZIP directly. If the endpoint is unavailable or Kaggle changes its access behaviour, download the ZIP from the Kaggle dataset page and place it in the same folder as this `.Rmd` file.
+
+```{r load-data, message=TRUE, warning=FALSE}
+dataset_url <- "https://www.kaggle.com/api/v1/datasets/download/anandshaw2001/video-game-sales"
+kaggle_page <- "https://www.kaggle.com/datasets/anandshaw2001/video-game-sales"
+
+required_columns <- c("Platform", "Genre", "Publisher", "Global_Sales")
+
+normalise_name <- function(x) {
+  tolower(gsub("[^a-z0-9]", "", x))
+}
+
+standardise_columns <- function(df) {
+  nms <- normalise_name(names(df))
+  aliases <- list(
+    Rank = c("rank"),
+    Name = c("name", "gamename", "title"),
+    Platform = c("platform", "system", "console"),
+    Year = c("year", "releaseyear"),
+    Genre = c("genre", "category"),
+    Publisher = c("publisher", "developerpublisher"),
+    NA_Sales = c("nasales", "northamericasales"),
+    EU_Sales = c("eusales", "europesales"),
+    JP_Sales = c("jpsales", "japansales"),
+    Other_Sales = c("othersales", "restofworldsales"),
+    Global_Sales = c("globalsales", "worldwidesales", "totalsales")
+  )
+  for (canonical in names(aliases)) {
+    idx <- match(aliases[[canonical]], nms, nomatch = 0)
+    idx <- idx[idx > 0]
+    if (length(idx) > 0) names(df)[idx[1]] <- canonical
+  }
+  df
+}
+
+has_required_columns <- function(path) {
+  tryCatch({
+    x <- read.csv(path, nrows = 5, check.names = FALSE)
+    x <- standardise_columns(x)
+    all(required_columns %in% names(x))
+  }, error = function(e) FALSE)
+}
+
+csv_files <- list.files(getwd(), pattern = "\\.csv$", full.names = TRUE, ignore.case = TRUE)
+valid_csv <- csv_files[vapply(csv_files, has_required_columns, logical(1))]
+
+if (length(valid_csv) == 0) {
+  zip_path <- file.path(getwd(), "video-game-sales.zip")
+  message("No compatible local CSV found. Attempting to download the public Kaggle dataset...")
+  download_success <- tryCatch({
+    utils::download.file(dataset_url, zip_path, mode = "wb", quiet = FALSE, method = "auto")
+    file.exists(zip_path) && file.info(zip_path)$size > 1000
+  }, error = function(e) {
+    message("Automatic download failed: ", conditionMessage(e))
+    FALSE
+  })
+
+  if (download_success) {
+    extracted_dir <- file.path(getwd(), "video_game_sales_download")
+    dir.create(extracted_dir, showWarnings = FALSE, recursive = TRUE)
+    try(utils::unzip(zip_path, exdir = extracted_dir), silent = TRUE)
+    extracted_csvs <- list.files(extracted_dir, pattern = "\\.csv$", full.names = TRUE,
+                                 recursive = TRUE, ignore.case = TRUE)
+    valid_csv <- extracted_csvs[vapply(extracted_csvs, has_required_columns, logical(1))]
+  }
+}
+
+if (length(valid_csv) == 0) {
+  stop(
+    "Could not find or download a compatible CSV. Please download the ZIP from ",
+    kaggle_page, " and place it in the same folder as this Rmd file."
+  )
+}
+
+dataset_path <- valid_csv[1]
+raw <- read.csv(dataset_path, check.names = FALSE, stringsAsFactors = FALSE)
+raw <- standardise_columns(raw)
+
+if (!all(required_columns %in% names(raw))) {
+  stop("Dataset is missing one or more required columns: ",
+       paste(setdiff(required_columns, names(raw)), collapse = ", "))
+}
+
+cat("Dataset loaded from:", dataset_path, "\n")
+cat("Original rows:", nrow(raw), "\n")
+cat("Original columns:", ncol(raw), "\n")
+knitr::kable(head(raw), caption = "First six rows of the raw dataset")
+```
+
+# 6. Data quality and preprocessing
+
+The next chunk counts missing values and exact duplicate rows. Exact duplicates are removed. Records with missing global sales or invalid global sales values are excluded from the classification task. Missing categorical labels are represented as `"Unknown"`; missing release years remain missing for EDA and are excluded from the model rows that require a year.
+
+```{r cleaning, message=FALSE, warning=FALSE}
+missing_summary <- data.frame(
+  Column = names(raw),
+  Missing_Count = vapply(raw, function(x) sum(is.na(x) | (is.character(x) & trimws(x) == "")), integer(1))
+) |>
+  dplyr::arrange(dplyr::desc(Missing_Count))
+
+duplicate_count <- sum(duplicated(raw))
+clean <- raw[!duplicated(raw), , drop = FALSE]
+
+clean$Global_Sales <- suppressWarnings(as.numeric(clean$Global_Sales))
+if ("Year" %in% names(clean)) clean$Year <- suppressWarnings(as.numeric(clean$Year))
+
+invalid_sales_count <- sum(is.na(clean$Global_Sales) | !is.finite(clean$Global_Sales) | clean$Global_Sales < 0)
+clean <- clean[!is.na(clean$Global_Sales) & is.finite(clean$Global_Sales) & clean$Global_Sales >= 0, , drop = FALSE]
+
+for (col in c("Genre", "Platform", "Publisher")) {
+  clean[[col]] <- trimws(as.character(clean[[col]]))
+  clean[[col]][is.na(clean[[col]]) | clean[[col]] == ""] <- "Unknown"
+}
+
+cat("Original rows:", nrow(raw), "\n")
+cat("Original columns:", ncol(raw), "\n")
+cat("Exact duplicate rows removed:", duplicate_count, "\n")
+cat("Rows removed due to missing/invalid Global_Sales:", invalid_sales_count, "\n")
+cat("Rows after cleaning:", nrow(clean), "\n")
+
+knitr::kable(missing_summary, caption = "Missing values by original column")
+```
+
+## 6.1 Missing-value chart
+
+```{r missing-chart, fig.width=8, fig.height=5}
+missing_plot_data <- missing_summary[missing_summary$Missing_Count > 0, , drop = FALSE]
+if (nrow(missing_plot_data) > 0) {
+  ggplot(missing_plot_data, aes(x = reorder(Column, Missing_Count), y = Missing_Count)) +
+    geom_col(fill = "#E58A2B") +
+    coord_flip() +
+    labs(title = "Missing Values by Column", x = NULL, y = "Missing cells") +
+    theme_minimal(base_size = 12)
+} else {
+  plot.new()
+  text(0.5, 0.5, "No missing values detected.")
+}
+```
+
+# 7. Exploratory data analysis
+
+## 7.1 Sales by genre
+
+```{r genre-analysis, fig.width=9, fig.height=6}
+genre_summary <- clean |>
+  group_by(Genre) |>
+  summarise(
+    Game_Records = n(),
+    Total_Global_Sales = sum(Global_Sales, na.rm = TRUE),
+    Median_Global_Sales = median(Global_Sales, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(Total_Global_Sales))
+
+knitr::kable(genre_summary, digits = 3, caption = "Sales summary by genre")
+
+ggplot(head(genre_summary, 12),
+       aes(x = reorder(Genre, Total_Global_Sales), y = Total_Global_Sales)) +
+  geom_col(fill = "#3478C8") +
+  coord_flip() +
+  labs(title = "Global Sales by Genre", x = "Genre", y = "Total Global Sales (dataset units)") +
+  theme_minimal(base_size = 12)
+```
+
+## 7.2 Sales by platform
+
+```{r platform-analysis, fig.width=9, fig.height=6}
+platform_summary <- clean |>
+  group_by(Platform) |>
+  summarise(
+    Game_Records = n(),
+    Total_Global_Sales = sum(Global_Sales, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(Total_Global_Sales))
+
+knitr::kable(head(platform_summary, 20), digits = 3, caption = "Top platforms by global sales")
+
+ggplot(head(platform_summary, 12),
+       aes(x = reorder(Platform, Total_Global_Sales), y = Total_Global_Sales)) +
+  geom_col(fill = "#18A999") +
+  coord_flip() +
+  labs(title = "Top Platforms by Global Sales", x = "Platform", y = "Total Global Sales (dataset units)") +
+  theme_minimal(base_size = 12)
+```
+
+## 7.3 Sales by publisher
+
+```{r publisher-analysis, fig.width=9, fig.height=6}
+publisher_summary <- clean |>
+  group_by(Publisher) |>
+  summarise(
+    Game_Records = n(),
+    Total_Global_Sales = sum(Global_Sales, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(Total_Global_Sales))
+
+knitr::kable(head(publisher_summary, 20), digits = 3, caption = "Top publishers by global sales")
+
+ggplot(head(publisher_summary, 12),
+       aes(x = reorder(Publisher, Total_Global_Sales), y = Total_Global_Sales)) +
+  geom_col(fill = "#7B61A8") +
+  coord_flip() +
+  labs(title = "Top Publishers by Global Sales", x = "Publisher", y = "Total Global Sales (dataset units)") +
+  theme_minimal(base_size = 12)
+```
+
+## 7.4 Release-year trend
+
+```{r year-analysis, fig.width=10, fig.height=6}
+yearly_summary <- clean |>
+  filter(!is.na(Year), Year >= 1970, Year <= as.numeric(format(Sys.Date(), "%Y")) + 1) |>
+  group_by(Year) |>
+  summarise(
+    Game_Records = n(),
+    Total_Global_Sales = sum(Global_Sales, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(Year)
+
+knitr::kable(head(yearly_summary, 20), digits = 3, caption = "First 20 release-year summaries")
+
+ggplot(yearly_summary, aes(x = Year, y = Total_Global_Sales)) +
+  geom_line(color = "#3478C8", linewidth = 0.9) +
+  geom_point(color = "#18A999", size = 1.5) +
+  labs(title = "Recorded Global Sales by Release Year", x = "Release year",
+       y = "Total Global Sales (dataset units)") +
+  theme_minimal(base_size = 12)
+```
+
+## 7.5 Regional sales
+
+```{r regional-analysis, fig.width=8, fig.height=5}
+regional_columns <- intersect(c("NA_Sales", "EU_Sales", "JP_Sales", "Other_Sales"), names(clean))
+if (length(regional_columns) > 0) {
+  regional_summary <- data.frame(
+    Region = regional_columns,
+    Total_Regional_Sales = vapply(regional_columns, function(col) {
+      sum(suppressWarnings(as.numeric(clean[[col]])), na.rm = TRUE)
+    }, numeric(1))
+  )
+  knitr::kable(regional_summary, digits = 3, caption = "Total sales by region")
+
+  ggplot(regional_summary, aes(x = reorder(Region, Total_Regional_Sales), y = Total_Regional_Sales)) +
+    geom_col(fill = "#D95F02") +
+    coord_flip() +
+    labs(title = "Regional Sales Comparison", x = "Region", y = "Total regional sales (dataset units)") +
+    theme_minimal(base_size = 12)
+} else {
+  cat("Regional sales columns are not available in this dataset.\n")
+}
+```
+
+## 7.6 Global sales distribution
+
+```{r sales-distribution, fig.width=9, fig.height=5}
+ggplot(clean, aes(x = Global_Sales)) +
+  geom_histogram(bins = 40, fill = "#3478C8", color = "white") +
+  labs(title = "Distribution of Global Sales", x = "Global sales (dataset units)", y = "Number of records") +
+  theme_minimal(base_size = 12)
+```
+
+# 8. Machine learning: High/Low sales classification
+
+The target is defined using the median `Global_Sales` of the training partition. Games with sales at or above that threshold are labelled `High`; games below it are labelled `Low`. The model uses `Genre`, `Platform`, `Publisher`, and `Year` as predictors. Sales columns are excluded from the predictors to reduce target leakage.
+
+The dataset is split into 75% training records and 25% test records. The test set is held aside for evaluation.
+
+```{r model-data, message=FALSE, warning=FALSE}
+model_data <- clean |>
+  transmute(
+    Genre = factor(Genre),
+    Platform = factor(Platform),
+    Publisher = factor(Publisher),
+    Year = as.numeric(Year),
+    Global_Sales = as.numeric(Global_Sales)
+  ) |>
+  filter(!is.na(Year), is.finite(Year), !is.na(Global_Sales))
+
+if (nrow(model_data) < 30) stop("Too few valid rows for a meaningful train/test split.")
+
+set.seed(42)
+train_rows <- sample(seq_len(nrow(model_data)), size = floor(0.75 * nrow(model_data)))
+train_raw <- model_data[train_rows, , drop = FALSE]
+test_raw <- model_data[-train_rows, , drop = FALSE]
+
+sales_threshold <- median(train_raw$Global_Sales, na.rm = TRUE)
+train_raw$Sales_Class <- factor(ifelse(train_raw$Global_Sales >= sales_threshold, "High", "Low"),
+                                levels = c("Low", "High"))
+test_raw$Sales_Class <- factor(ifelse(test_raw$Global_Sales >= sales_threshold, "High", "Low"),
+                               levels = c("Low", "High"))
+
+cat("Model rows:", nrow(model_data), "\n")
+cat("Training rows:", nrow(train_raw), "\n")
+cat("Test rows:", nrow(test_raw), "\n")
+cat("High/Low threshold (training median):", sales_threshold, "\n")
+knitr::kable(as.data.frame(prop.table(table(train_raw$Sales_Class))),
+             caption = "Training-set class proportions")
+```
+
+## 8.1 Align categorical levels and group rare categories
+
+```{r model-prepare, message=FALSE, warning=FALSE}
+prepare_factor_pair <- function(train_x, test_x, min_count = 10) {
+  train_x <- as.character(train_x)
+  test_x <- as.character(test_x)
+  counts <- table(train_x)
+  common <- names(counts[counts >= min_count])
+  train_x[!train_x %in% common] <- "Other"
+  test_x[!test_x %in% common] <- "Other"
+  levels_all <- unique(c(common, "Other"))
+  list(
+    train = factor(train_x, levels = levels_all),
+    test = factor(test_x, levels = levels_all)
+  )
+}
+
+genre_pair <- prepare_factor_pair(train_raw$Genre, test_raw$Genre, min_count = 2)
+platform_pair <- prepare_factor_pair(train_raw$Platform, test_raw$Platform, min_count = 30)
+publisher_pair <- prepare_factor_pair(train_raw$Publisher, test_raw$Publisher, min_count = 100)
+
+train_model <- data.frame(
+  Sales_Class = train_raw$Sales_Class,
+  Genre = genre_pair$train,
+  Platform = platform_pair$train,
+  Publisher = publisher_pair$train,
+  Year = train_raw$Year
+)
+test_model <- data.frame(
+  Sales_Class = test_raw$Sales_Class,
+  Genre = genre_pair$test,
+  Platform = platform_pair$test,
+  Publisher = publisher_pair$test,
+  Year = test_raw$Year
+)
+```
+
+## 8.2 Helper functions for evaluation
+
+```{r evaluation-helpers}
+safe_ratio <- function(a, b) if (is.na(b) || b == 0) NA_real_ else a / b
+
+auc_from_ranks <- function(probability, actual_class) {
+  actual_class <- as.character(actual_class)
+  ok <- is.finite(probability) & !is.na(actual_class)
+  probability <- probability[ok]
+  actual_class <- actual_class[ok]
+  n_pos <- sum(actual_class == "High")
+  n_neg <- sum(actual_class == "Low")
+  if (n_pos == 0 || n_neg == 0) return(NA_real_)
+  ranks <- rank(probability, ties.method = "average")
+  (sum(ranks[actual_class == "High"]) - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+}
+
+evaluate_classifier <- function(actual, predicted, probability_high, model_name) {
+  actual <- factor(actual, levels = c("Low", "High"))
+  predicted <- factor(predicted, levels = c("Low", "High"))
+  cm <- table(Actual = actual, Predicted = predicted)
+  tn <- as.numeric(cm["Low", "Low"])
+  fp <- as.numeric(cm["Low", "High"])
+  fn <- as.numeric(cm["High", "Low"])
+  tp <- as.numeric(cm["High", "High"])
+  precision <- safe_ratio(tp, tp + fp)
+  recall <- safe_ratio(tp, tp + fn)
+  f1 <- if (is.na(precision) || is.na(recall) || precision + recall == 0) NA_real_ else 2 * precision * recall / (precision + recall)
+  list(
+    confusion = cm,
+    metrics = data.frame(
+      Model = model_name,
+      Accuracy = safe_ratio(tp + tn, sum(cm)),
+      Precision_High = precision,
+      Recall_High = recall,
+      Specificity_Low = safe_ratio(tn, tn + fp),
+      F1_High = f1,
+      AUC_High = auc_from_ranks(probability_high, actual),
+      stringsAsFactors = FALSE
+    )
+  )
+}
+```
+
+## 8.3 Train and evaluate the Decision Tree
+
+```{r decision-tree, message=FALSE, warning=FALSE}
+sales_tree <- rpart(
+  Sales_Class ~ Genre + Platform + Publisher + Year,
+  data = train_model,
+  method = "class",
+  control = rpart.control(cp = 0.005, maxdepth = 6, minsplit = 20)
+)
+
+tree_prob_matrix <- predict(sales_tree, newdata = test_model, type = "prob")
+tree_high_probability <- if ("High" %in% colnames(tree_prob_matrix)) tree_prob_matrix[, "High"] else rep(0, nrow(test_model))
+tree_predicted <- factor(ifelse(tree_high_probability >= 0.5, "High", "Low"), levels = c("Low", "High"))
+
+tree_results <- evaluate_classifier(test_model$Sales_Class, tree_predicted, tree_high_probability, "Decision Tree")
+knitr::kable(tree_results$confusion, caption = "Decision Tree confusion matrix")
+
+knitr::kable(tree_results$metrics, digits = 3, caption = "Decision Tree test metrics")
+
+rpart.plot(sales_tree, type = 3, extra = 104, fallen.leaves = TRUE,
+           main = "Decision Tree: High vs Low Sales")
+```
+
+## 8.4 Train and evaluate Logistic Regression
+
+Logistic Regression estimates the probability that a record belongs to the High Sales class. A probability of 0.50 or above is classified as High; otherwise it is classified as Low. Factor levels are aligned between training and test data, and rare platform/publisher categories are grouped to help reduce sparse predictors.
+
+```{r logistic-regression, message=FALSE, warning=FALSE}
+# Use the already aligned model data. glm(binomial) models the probability of High.
+sales_logistic <- glm(
+  I(Sales_Class == "High") ~ Genre + Platform + Publisher + Year,
+  data = transform(train_model, Sales_Class = train_model$Sales_Class),
+  family = binomial(link = "logit")
+)
+
+logistic_high_probability <- as.numeric(predict(sales_logistic, newdata = test_model, type = "response"))
+logistic_high_probability <- pmin(pmax(logistic_high_probability, 0), 1)
+logistic_predicted <- factor(ifelse(logistic_high_probability >= 0.5, "High", "Low"),
+                             levels = c("Low", "High"))
+
+logistic_results <- evaluate_classifier(test_model$Sales_Class, logistic_predicted,
+                                        logistic_high_probability, "Logistic Regression")
+knitr::kable(logistic_results$confusion, caption = "Logistic Regression confusion matrix")
+knitr::kable(logistic_results$metrics, digits = 3, caption = "Logistic Regression test metrics")
+```
+
+## 8.5 Compare models
+
+```{r model-comparison, fig.width=10, fig.height=6}
+model_comparison <- dplyr::bind_rows(tree_results$metrics, logistic_results$metrics)
+knitr::kable(model_comparison, digits = 3, caption = "Decision Tree vs Logistic Regression")
+
+comparison_long <- tidyr::pivot_longer(
+  model_comparison,
+  cols = c(Accuracy, Precision_High, Recall_High, Specificity_Low, F1_High, AUC_High),
+  names_to = "Metric", values_to = "Score"
+)
+
+ggplot(comparison_long, aes(x = Metric, y = Score, fill = Model)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.72) +
+  coord_cartesian(ylim = c(0, 1)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2)) +
+  labs(title = "Decision Tree vs Logistic Regression",
+       x = NULL, y = "Score (0–1)", fill = "Model") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+```
+
+# 9. LIME: explain individual Logistic Regression predictions
+
+LIME approximates the model's behaviour around individual records and highlights features that support or oppose a prediction. The explanations are local and do not establish causation.
+
+```{r lime-explanations, message=FALSE, warning=FALSE, fig.width=11, fig.height=8}
+# LIME needs the same predictor columns and factor levels used by the fitted model.
+lime_train_x <- as.data.frame(train_model[, c("Genre", "Platform", "Publisher", "Year")])
+lime_test_x <- as.data.frame(test_model[, c("Genre", "Platform", "Publisher", "Year")])
+
+predict_model.video_game_lime_glm <- function(x, newdata, type, ...) {
+  p_high <- as.numeric(predict(x$model, newdata = newdata, type = "response"))
+  p_high <- pmin(pmax(p_high, 0), 1)
+  if (identical(type, "prob")) {
+    return(data.frame(Low = 1 - p_high, High = p_high, check.names = FALSE))
+  }
+  if (identical(type, "raw")) {
+    return(data.frame(Response = ifelse(p_high >= 0.5, "High", "Low")))
+  }
+  stop("Unsupported prediction type requested by lime.")
+}
+
+model_type.video_game_lime_glm <- function(x, ...) "classification"
+
+registerS3method("predict_model", "video_game_lime_glm",
+                 predict_model.video_game_lime_glm, envir = asNamespace("lime"))
+registerS3method("model_type", "video_game_lime_glm",
+                 model_type.video_game_lime_glm, envir = asNamespace("lime"))
+
+lime_model <- structure(list(model = sales_logistic), class = "video_game_lime_glm")
+lime_explainer <- lime::lime(lime_train_x, model = lime_model,
+                             bin_continuous = TRUE, n_bins = 4)
+
+valid_indices <- which(is.finite(logistic_high_probability))
+if (length(valid_indices) >= 2) {
+  sorted_indices <- valid_indices[order(logistic_high_probability[valid_indices], decreasing = TRUE)]
+  lime_indices <- unique(c(head(sorted_indices, 2), tail(sorted_indices, 2)))
+  lime_cases <- lime_test_x[lime_indices, , drop = FALSE]
+  rownames(lime_cases) <- paste0("TestCase_", seq_len(nrow(lime_cases)))
+
+  set.seed(42)
+  lime_explanations <- lime::explain(
+    lime_cases, explainer = lime_explainer,
+    labels = "High", n_features = 4, n_permutations = 500
+  )
+  print(lime::plot_features(lime_explanations, ncol = 2))
+  knitr::kable(
+    lime_explanations[, intersect(c("case", "label", "label_prob", "feature", "feature_value", "feature_weight"), names(lime_explanations))],
+    digits = 3, caption = "LIME local explanations for selected test cases"
+  )
+} else {
+  cat("Not enough valid test predictions to generate LIME explanations.\n")
+}
+```
+
+# 10. Findings and conclusion
+
+The tables and charts generated above should be interpreted using the actual results produced when the document is knitted. Do not assume one model is better until the test metrics are compared.
+
+The case study combines exploratory analysis and supervised classification. The sales summaries describe historical patterns; the Decision Tree and Logistic Regression models evaluate whether genre, platform, publisher, and year help classify records into the dataset-defined High/Low sales categories. LIME adds local explanations for selected Logistic Regression predictions.
+
+The results are not causal evidence and should not be used as a guarantee of future sales. Future work could explore cross-validation, more careful handling of rare categories, class imbalance, and additional predictors that would be known before a game is released.
+
+# 11. Reproducibility notes
+
+- Random seed: `42`.
+- Train/test split: 75% training, 25% testing.
+- Classification threshold: training-set median `Global_Sales`.
+- Positive class: `High`.
+- Predictors: `Genre`, `Platform`, `Publisher`, and `Year`.
+- Dataset source: Kaggle Video Game Sales dataset.
